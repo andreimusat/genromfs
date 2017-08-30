@@ -92,18 +92,20 @@ struct romfh {
 	int32_t checksum;
 };
 
-#define ROMFS_MAXFN 128
-#define ROMFH_HRD 0
-#define ROMFH_DIR 1
-#define ROMFH_REG 2
-#define ROMFH_LNK 3
-#define ROMFH_BLK 4
-#define ROMFH_CHR 5
-#define ROMFH_SCK 6
-#define ROMFH_FIF 7
-#define ROMFH_EXEC 8
+#define ROMFS_BSIZE	    1024
+#define ROMFS_MASK	    ((ROMFS_BSIZE) - 1)
+#define ROMFS_MAXFN	    128
+#define ROMFH_HRD	    0
+#define ROMFH_DIR	    1
+#define ROMFH_REG	    2
+#define ROMFH_LNK	    3
+#define ROMFH_BLK	    4
+#define ROMFH_CHR	    5
+#define ROMFH_SCK	    6
+#define ROMFH_FIF	    7
+#define ROMFH_EXEC	    8
 
-#define ROMEXT_MAGIC3	"xyz"
+#define ROMEXT_MAGIC3	    "xyz"
 
 /*
  * extension tag, starting backwards from the fileheader:
@@ -179,13 +181,13 @@ struct filenode {
 	int extlen;
 };
 
-#define EXTTYPE_UNKNOWN 0
-#define EXTTYPE_ALIGNMENT 1
-#define EXTTYPE_EXCLUDE 2
-#define EXTTYPE_EXTPERM 3
-#define EXTTYPE_EXTUID 4
-#define EXTTYPE_EXTGID 5
-#define EXTTYPE_EXTTIME 6
+#define EXTTYPE_UNKNOWN     0
+#define EXTTYPE_ALIGNMENT   1
+#define EXTTYPE_EXCLUDE     2
+#define EXTTYPE_EXTPERM     3
+#define EXTTYPE_EXTUID      4
+#define EXTTYPE_EXTGID      5
+#define EXTTYPE_EXTTIME     6
 struct extmatches {
 	struct extmatches *next;
 	unsigned int exttype;
@@ -239,6 +241,9 @@ void shownode(int level, struct filenode *node, FILE *f)
 static char bigbuf[4096];
 static char fixbuf[512];
 static int atoffs = 0;
+/* TODO: Quick and dirty workaround for the checksum logic. It's faster than rewriting parts of the
+ * dump functions. */
+static int final_write = 0;
 static struct extmatches *patterns = NULL;
 static int realbase;
 static int extlevel = 0;
@@ -303,7 +308,8 @@ void dumpdata(void *addr, int len, FILE *f)
 
 	if (!len)
 		return;
-	if (atoffs >= 512) {
+
+        if (atoffs >= 512) {
 		fwrite(addr, len, 1, f);
 		atoffs+=len;
 		return;
@@ -315,7 +321,7 @@ void dumpdata(void *addr, int len, FILE *f)
 	addr=(char*)addr+tocopy;
 	len-=tocopy;
 
-	if (atoffs==512) {
+	if (atoffs==512 || final_write == 1) {
 		ri = (struct romfh *)&fixbuf;
 		fixsum(ri, atoffs<ntohl(ri->size)?atoffs:ntohl(ri->size));
 		fwrite(fixbuf, atoffs, 1, f);
@@ -376,11 +382,13 @@ void dumpri(struct romfh *ri, struct filenode *n, FILE *f)
 
 void dumpnode(struct filenode *node, FILE *f)
 {
+	int ret;
 	struct romfh ri;
 	struct filenode *p;
 
-	if (node->prepad)
+	if (node->prepad) {
 		dumpzero(node->prepad, f);
+        }
 	if (node->extlen) {
 		dumpdataa(node->extdata+sizeof(node->extdata)-node->extlen, node->extlen, f);
 	}
@@ -414,7 +422,11 @@ void dumpnode(struct filenode *node, FILE *f)
 		ri.nextfh |= htonl(ROMFH_LNK);
 		dumpri(&ri, node, f);
 		memset(bigbuf, 0, sizeof(bigbuf));
-		readlink(node->realname, bigbuf, node->realsize);
+		ret = readlink(node->realname, bigbuf, node->realsize);
+		if (ret < 0) {
+			fprintf(stderr, "Failed to read link %s\n",node->realname);
+			exit(1);
+		}
 		dumpdataa(bigbuf, node->realsize, f);
 	} else if (S_ISREG(node->modes)) {
 		int offset, len, fd, max, avail;
@@ -488,7 +500,7 @@ void dumpnode(struct filenode *node, FILE *f)
 	}
 }
 
-void dumpall(struct filenode *node, int lastoff, FILE *f)
+void dumpall(struct filenode *node, int lastoff, FILE *f, int padding)
 {
 	struct romfh ri;
 	struct filenode *p;
@@ -503,9 +515,16 @@ void dumpall(struct filenode *node, int lastoff, FILE *f)
 		dumpnode(p, f);
 		p = p->next;
 	}
+
 	/* Align the whole bunch to ROMBSIZE boundary */
-	if (lastoff&1023)
-		dumpzero(1024-(lastoff&1023), f);
+	if ((lastoff & ROMFS_MASK)) {
+            final_write = 1;
+            if (padding) {
+		dumpzero(ROMFS_BSIZE - (lastoff & ROMFS_MASK), f);
+            } else {
+		dumpzero((lastoff & ROMFS_MASK), f);
+            }
+        }
 }
 
 /* Node manipulating functions */
@@ -631,12 +650,20 @@ int alignnode(struct filenode *node, int curroffset, int extraspace)
 		if (S_ISREG(node->modes)) {
 			if ((fd = open(node->realname, O_RDBIN)) >= 0) {
 				memset(bigbuf, 0, 16);
-				read(fd, bigbuf, 16);
+				d = read(fd, bigbuf, 16);
+				if (d < 0) {
+					fprintf(stderr,"Internal error, couldn't open fd %i\n", fd);
+					exit(1);
+				}
 				checkpos = 0;
 			}
 		} else if (S_ISLNK(node->modes)) {
 			memset(bigbuf, 0, sizeof(bigbuf));
-			readlink(node->realname, bigbuf, sizeof(bigbuf)-1);
+			d = readlink(node->realname, bigbuf, sizeof(bigbuf)-1);
+			if (d < 0) {
+				fprintf(stderr,"Internal error, couldn't read link %s\n", node->realname);
+				exit(1);
+			}
 		} else {
 			fprintf(stderr,"internal error, %s has size?\n", node->realname);
 			exit(1);
@@ -795,8 +822,9 @@ int buildromext(struct filenode *node)
 }
 
 int processdir(int level, const char *base, const char *dirname, struct stat *sb,
-	struct filenode *dir, struct filenode *root, int curroffset)
+	struct filenode *dir, struct filenode *root, int curroffset, int link_dirs)
 {
+	int ret;
 	DIR *dirfd;
 	struct dirent *dp;
 	struct filenode *n, *link;
@@ -806,7 +834,7 @@ int processdir(int level, const char *base, const char *dirname, struct stat *sb
 	 * root directory, we add them first.  Note also that we
 	 * alloc them first to get to know the real name
 	 */
-	if (level <= 1) {
+	if ((level <= 1) && link_dirs) {
 		link = newnode(base, ".", curroffset);
 		link->isrootdot = 1;
 		if (!lstat(link->realname, sb)) {
@@ -814,9 +842,9 @@ int processdir(int level, const char *base, const char *dirname, struct stat *sb
 			append(&dir->dirlist, link);
 
 			/* special case for root node - '..'s in
-			 * subdirs should link to '.' of root
-			 * node, not root node itself.
-			 */
+			* subdirs should link to '.' of root
+			* node, not root node itself.
+			*/
 			dir->dirlist.owner = link;
 
 			curroffset = alignnode(link, curroffset, 0) + spaceneeded(link,0);
@@ -868,7 +896,11 @@ int processdir(int level, const char *base, const char *dirname, struct stat *sb
 				/* this is a link to follow at build time */
 				n->name = n->name + 1; /* strip off the leading @ */
 				memset(bigbuf, 0, sizeof(bigbuf));
-				readlink(n->realname, bigbuf, sizeof(bigbuf));
+				ret = readlink(n->realname, bigbuf, sizeof(bigbuf));
+				if (ret < 0) {
+					fprintf(stderr, "Couldn't read link '%s\n", n->realname);
+					return -1;
+				}
 				n->realname = strdup(bigbuf);
 
 				if (lstat(n->realname, sb)) {
@@ -954,10 +986,10 @@ int processdir(int level, const char *base, const char *dirname, struct stat *sb
 		if (S_ISDIR(sb->st_mode)) {
 			if (!strcmp(n->name, "..")) {
 				curroffset = processdir(level+1, dir->realname, dp->d_name,
-							sb, dir, root, curroffset);
+							sb, dir, root, curroffset, link_dirs);
 			} else {
 				curroffset = processdir(level+1, n->realname, dp->d_name,
-							sb, n, root, curroffset);
+							sb, n, root, curroffset, link_dirs);
 			}
 		}
 	}
@@ -979,6 +1011,8 @@ void showhelp(const char *argv0)
 	printf("  -A ALIGN,PATTERN       Align all objects matching pattern to at least ALIGN bytes\n");
 	printf("  -x PATTERN             Exclude all objects matching pattern\n");
 	printf("  -i PATTERN             Include all objects matching pattern\n");
+	printf("  -b DISABLE             Prevent the creation of '.' and '..' in the root\n");
+	printf("  -p DISABLE             Disable the 0 padding added to the end of the image\n");
 	printf("  -h                     Show this help\n");
 	printf("\n");
 	printf("To report bugs check http://romfs.sf.net/\n");
@@ -990,7 +1024,9 @@ int main(int argc, char *argv[])
 	char *dir = ".";
 	char *outf = NULL;
 	char *volname = NULL;
-	int verbose=0;
+	int verbose = 0;
+	int padding = 1;
+	int link_dirs = 1;
 	char buf[256];
 	struct filenode *root;
 	struct stat sb;
@@ -999,7 +1035,7 @@ int main(int argc, char *argv[])
 	char *p,*optn,*optpat;
 	FILE *f;
 
-	while ((c = getopt(argc, argv, "V:vd:f:ha:A:x:i:e:")) != EOF) {
+	while ((c = getopt(argc, argv, "V:vd:f:ha:A:x:i:e:b:p:s:")) != EOF) {
 		switch(c) {
 		case 'd':
 			dir = optarg;
@@ -1012,6 +1048,16 @@ int main(int argc, char *argv[])
 			break;
 		case 'v':
 			verbose = 1;
+			break;
+		case 'b':
+			if (strcmp(optarg, "disable") || strcmp(optarg, "DISABLE")) {
+				link_dirs = 0;
+			}
+			break;
+		case 'p':
+			if (strcmp(optarg, "disable") || strcmp(optarg, "DISABLE")) {
+				padding = 0;
+			}
 			break;
 		case 'h':
 			showhelp(argv[0]);
@@ -1122,10 +1168,10 @@ int main(int argc, char *argv[])
 	realbase = strlen(dir);
 	root = newnode(dir, volname, 0);
 	root->parent = root;
-	lastoff = processdir (1, dir, dir, &sb, root, root, spaceneeded(root,0));
+	lastoff = processdir (1, dir, dir, &sb, root, root, spaceneeded(root,0), link_dirs);
 	if (verbose)
 		shownode(0, root, stderr);
-	dumpall(root, lastoff, f);
+	dumpall(root, lastoff, f, padding);
 
 	exit(0);
 }
